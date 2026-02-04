@@ -13,7 +13,7 @@ Adds a top bar to the chat window with shortcuts to quick actions (left to right
 
 ## How to install
 
-Use this URL with the extension installer: `https://github.com/SillyTavern/Extension-TopInfoBar`
+Use this URL with the extension installer: `https://github.com/bla6987/Extension-TopInfoBar`
 
 ## License
 
