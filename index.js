@@ -22,6 +22,81 @@ const chat = /** @type {HTMLDivElement} */ (document.getElementById('chat'));
 const draggableTemplate = /** @type {HTMLTemplateElement} */ (document.getElementById('generic_draggable_template'));
 const apiBlock = /** @type {HTMLDivElement} */ (document.getElementById('rm_api_block'));
 
+/**
+ * Cache for message elements and their text content for faster search
+ */
+class MessageCache {
+    constructor() {
+        /** @type {Array<{element: HTMLElement, textLower: string}>} */
+        this.messages = [];
+        this.observer = null;
+    }
+
+    /**
+     * Initialize the cache and set up mutation observer
+     */
+    init() {
+        this.rebuild();
+        this.observer = new MutationObserver((mutations) => {
+            let needsUpdate = false;
+            for (const mutation of mutations) {
+                if (mutation.type === 'childList') {
+                    // Check if any added/removed nodes contain .mes_text
+                    for (const node of mutation.addedNodes) {
+                        if (node instanceof HTMLElement && (node.classList?.contains('mes_text') || node.querySelector?.('.mes_text'))) {
+                            needsUpdate = true;
+                            break;
+                        }
+                    }
+                    for (const node of mutation.removedNodes) {
+                        if (node instanceof HTMLElement && (node.classList?.contains('mes_text') || node.querySelector?.('.mes_text'))) {
+                            needsUpdate = true;
+                            break;
+                        }
+                    }
+                }
+                if (needsUpdate) break;
+            }
+            if (needsUpdate) {
+                this.rebuild();
+                // Re-run search if there's a query
+                if (searchInput.value.trim()) {
+                    searchDebounced(searchInput.value.trim());
+                }
+            }
+        });
+        this.observer.observe(chat, { childList: true, subtree: true });
+    }
+
+    /**
+     * Rebuild the cache from DOM
+     */
+    rebuild() {
+        const elements = chat.querySelectorAll('.mes_text');
+        this.messages = Array.from(elements).map(el => ({
+            element: /** @type {HTMLElement} */ (el),
+            textLower: el.textContent?.toLowerCase() || '',
+        }));
+    }
+
+    /**
+     * Get cached messages
+     * @returns {Array<{element: HTMLElement, textLower: string}>}
+     */
+    getMessages() {
+        return this.messages;
+    }
+
+    /**
+     * Clear the cache
+     */
+    clear() {
+        this.messages = [];
+    }
+}
+
+const messageCache = new MessageCache();
+
 const topBar = document.createElement('div');
 const chatName = document.createElement('select');
 const searchInput = document.createElement('input');
@@ -232,22 +307,60 @@ async function getChatFiles() {
 }
 
 /**
+ * Clear all search highlights
+ * @param {object} options Highlight options
+ */
+function clearHighlights(options) {
+    // Only target elements with actual highlights for efficiency
+    jQuery(chat).find('mark.highlight').each(function () {
+        jQuery(this).unhighlight(options);
+    });
+}
+
+/**
  * Highlight search query in chat messages
  * @param {string} query Search query
  * @returns {void}
  */
 function searchInChat(query) {
     const options = { element: 'mark', className: 'highlight' };
-    const messages = jQuery(chat).find('.mes_text');
-    messages.unhighlight(options);
+
+    // Clear existing highlights
+    clearHighlights(options);
+
     if (!query) {
         return;
     }
-    const splitQuery = query.split(/\s|\b/);
-    messages.highlight(splitQuery, options);
+
+    // Split query into terms and filter empty strings
+    const queryTerms = query.split(/\s+/).filter(t => t.length > 0);
+    if (queryTerms.length === 0) {
+        return;
+    }
+
+    const queryLower = queryTerms.map(t => t.toLowerCase());
+
+    // Pre-filter: only highlight messages containing search terms
+    const cached = messageCache.getMessages();
+    const matching = cached.filter(m =>
+        queryLower.some(term => m.textLower.includes(term)),
+    );
+
+    // Only call highlight on messages that actually contain matches
+    if (matching.length > 0) {
+        jQuery(matching.map(m => m.element)).highlight(queryTerms, options);
+    }
 }
 
-const searchDebounced = debounce((x) => searchInChat(x), 500);
+const searchDebounced = debounce((x) => searchInChat(x), 250);
+
+/**
+ * Clear search input and highlights
+ */
+function clearSearch() {
+    searchInput.value = '';
+    searchInChat('');
+}
 const updateStatusDebounced = debounce(onOnlineStatusChange, 1000);
 
 function addTopBar() {
@@ -677,6 +790,13 @@ function restorePanelsState() {
     for (const eventName of [event_types.CHAT_CHANGED, event_types.CHAT_DELETED, event_types.GROUP_CHAT_DELETED]) {
         eventSource.on(eventName, setChatNameDebounced);
     }
+    // Clear search and rebuild cache on chat change
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        clearSearch();
+        messageCache.rebuild();
+    });
+    // Initialize message cache
+    messageCache.init();
     eventSource.once(event_types.APP_READY, () => {
         bindConnectionProfilesSelect();
         restorePanelsState();
