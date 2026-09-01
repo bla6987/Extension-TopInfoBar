@@ -20,10 +20,15 @@ This document describes the search functionality in the Extension-TopInfoBar for
 - Auto-updates highlights when new messages arrive
 
 **Implementation Details**:
-- `searchInChat()` function (index.js:325-353)
-- `MessageCache` class caches message elements with pre-lowercased text (index.js:28-96)
+- `searchInChat()` in `index.js` coordinates query parsing and highlighting
+- `MessageCache` in `message-cache.js` caches message elements with pre-lowercased text while search is active
 - Uses custom jQuery highlight plugin (jquery-highlight.js)
-- MutationObserver automatically rebuilds cache on DOM changes
+- The cache and MutationObserver are activated only while a non-empty search is active
+- Added, edited, streamed, and removed messages update incrementally in one animation-frame batch; unchanged messages are not rescanned
+- Only messages whose rendered text changed have their active highlights recalculated
+- Clearing search or changing chats disconnects the observer and releases cached message text
+
+The incremental cache has a browser test fixture at `tests/message-cache.test.html` covering a 1,000-message initial render, single-message append/edit/delete, highlight DOM mutations, bulk insertion, matching, and cleanup.
 
 **Does NOT**:
 - Search across multiple chat threads

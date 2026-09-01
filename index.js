@@ -15,6 +15,7 @@ import { getPastCharacterChats, animation_duration, animation_easing, getGenerat
 import { debounce, timestampToMoment, sortMoments, uuidv4, waitUntilCondition } from '../../../utils.js';
 import { debounce_timeout } from '../../../constants.js';
 import { t } from '../../../i18n.js';
+import { MessageCache } from './message-cache.js';
 
 const movingDivs = /** @type {HTMLDivElement} */ (document.getElementById('movingDivs'));
 const sheld = /** @type {HTMLDivElement} */ (document.getElementById('sheld'));
@@ -22,88 +23,22 @@ const chat = /** @type {HTMLDivElement} */ (document.getElementById('chat'));
 const draggableTemplate = /** @type {HTMLTemplateElement} */ (document.getElementById('generic_draggable_template'));
 const apiBlock = /** @type {HTMLDivElement} */ (document.getElementById('rm_api_block'));
 
-/**
- * Cache for message elements and their text content for faster search
- */
-class MessageCache {
-    constructor() {
-        /** @type {Array<{element: HTMLElement, textLower: string}>} */
-        this.messages = [];
-        this.observer = null;
-    }
-
-    /**
-     * Initialize the cache and set up mutation observer
-     */
-    init() {
-        this.rebuild();
-        this.observer = new MutationObserver((mutations) => {
-            let needsUpdate = false;
-            for (const mutation of mutations) {
-                if (mutation.type === 'childList') {
-                    // Check if any added/removed nodes contain .mes_text
-                    for (const node of mutation.addedNodes) {
-                        if (node instanceof HTMLElement && (node.classList?.contains('mes_text') || node.querySelector?.('.mes_text'))) {
-                            needsUpdate = true;
-                            break;
-                        }
-                    }
-                    for (const node of mutation.removedNodes) {
-                        if (node instanceof HTMLElement && (node.classList?.contains('mes_text') || node.querySelector?.('.mes_text'))) {
-                            needsUpdate = true;
-                            break;
-                        }
-                    }
-                }
-                if (needsUpdate) break;
-            }
-            if (needsUpdate) {
-                this.rebuild();
-                // Re-run search if there's a query
-                if (searchInput.value.trim()) {
-                    searchDebounced(searchInput.value.trim());
-                }
-            }
-        });
-        this.observer.observe(chat, { childList: true, subtree: true });
-    }
-
-    /**
-     * Rebuild the cache from DOM
-     */
-    rebuild() {
-        const elements = chat.querySelectorAll('.mes_text');
-        this.messages = Array.from(elements).map(el => ({
-            element: /** @type {HTMLElement} */ (el),
-            textLower: el.textContent?.toLowerCase() || '',
-        }));
-    }
-
-    /**
-     * Get cached messages
-     * @returns {Array<{element: HTMLElement, textLower: string}>}
-     */
-    getMessages() {
-        return this.messages;
-    }
-
-    /**
-     * Clear the cache
-     */
-    clear() {
-        this.messages = [];
-    }
-}
-
-const messageCache = new MessageCache();
+const messageCache = new MessageCache(chat, onMessageCacheChanged);
 
 const topBar = document.createElement('div');
 const chatName = document.createElement('select');
 const searchInput = document.createElement('input');
+/** @type {Set<HTMLElement>} */
+const highlightedMessages = new Set();
 const connectionProfiles = document.createElement('div');
 const connectionProfilesStatus = document.createElement('div');
 const connectionProfilesSelect = document.createElement('select');
 const connectionProfilesIcon = document.createElement('img');
+
+let chatSelectorContextKey = null;
+let loadedChatSelectorContextKey = null;
+let chatSelectorLoadGeneration = 0;
+let chatSelectorLoadPromise = null;
 
 const icons = [
     {
@@ -209,14 +144,43 @@ function patchSheldIfNeeded() {
     }
 }
 
+function getChatSelectorContextKey(context = SillyTavern.getContext()) {
+    if (context.groupId) {
+        return `group:${context.groupId}`;
+    }
+
+    if (context.characterId !== undefined) {
+        return `character:${context.characterId}`;
+    }
+
+    return 'none';
+}
+
+function invalidateChatSelector() {
+    loadedChatSelectorContextKey = null;
+    chatSelectorLoadGeneration++;
+    chatSelectorLoadPromise = null;
+}
+
 function setChatName(name) {
     const isNotInChat = !name;
-    chatName.innerHTML = '';
-    const selectedOption = document.createElement('option');
-    selectedOption.innerText = name || t`No chat selected`;
+    const contextKey = getChatSelectorContextKey();
+
+    if (chatSelectorContextKey !== contextKey || isNotInChat) {
+        chatName.replaceChildren();
+        chatSelectorContextKey = contextKey;
+    }
+
+    let selectedOption = Array.from(chatName.options).find(option => option.value === name);
+    if (!selectedOption) {
+        selectedOption = document.createElement('option');
+        selectedOption.innerText = name || t`No chat selected`;
+        selectedOption.value = name || '';
+        chatName.appendChild(selectedOption);
+    }
+
     selectedOption.selected = true;
-    chatName.appendChild(selectedOption);
-    chatName.disabled = true;
+    chatName.disabled = isNotInChat;
 
     icons.forEach(icon => {
         const iconElement = document.getElementById(icon.id);
@@ -224,42 +188,69 @@ function setChatName(name) {
             iconElement.classList.toggle('not-in-chat', isNotInChat);
         }
     });
+}
 
-    if (!isNotInChat && typeof openGroupChat === 'function' && typeof openCharacterChat === 'function') {
-        setTimeout(async () => {
-            const list = [];
-            const context = SillyTavern.getContext();
-            if (context.groupId) {
-                const group = context.groups.find(x => x.id == context.groupId);
-                if (group) {
-                    list.push(...group.chats);
-                }
-            }
-            else {
-                const characterAvatar = context.characters[context.characterId]?.avatar;
-                list.push(...await getListOfCharacterChats(characterAvatar));
-            }
-
-            if (list.length > 0) {
-                chatName.innerHTML = '';
-                list.sort((a, b) => a.localeCompare(b)).forEach((x) => {
-                    const option = document.createElement('option');
-                    option.innerText = x;
-                    option.value = x;
-                    option.selected = x === name;
-
-                    chatName.appendChild(option);
-                });
-                chatName.disabled = false;
-            }
-
-            await populateSideBar();
-        }, 0);
+/**
+ * Populate the chat selector only when the user interacts with it.
+ * Chat changes and forks merely update the selected option.
+ */
+function ensureChatSelectorLoaded() {
+    const name = getCurrentChatId();
+    if (!name || typeof openGroupChat !== 'function' || typeof openCharacterChat !== 'function') {
+        return;
     }
 
-    if (isNotInChat) {
-        setTimeout(() => populateSideBar(), 0);
+    const context = SillyTavern.getContext();
+    const contextKey = getChatSelectorContextKey(context);
+    if (loadedChatSelectorContextKey === contextKey) {
+        return;
     }
+
+    if (chatSelectorLoadPromise?.contextKey === contextKey) {
+        return chatSelectorLoadPromise.promise;
+    }
+
+    const generation = ++chatSelectorLoadGeneration;
+    const promise = (async () => {
+        const list = [];
+        if (context.groupId) {
+            const group = context.groups.find(x => x.id == context.groupId);
+            if (group) {
+                list.push(...group.chats);
+            }
+        } else {
+            const characterAvatar = context.characters[context.characterId]?.avatar;
+            list.push(...await getListOfCharacterChats(characterAvatar));
+        }
+
+        if (generation !== chatSelectorLoadGeneration
+            || getChatSelectorContextKey() !== contextKey
+            || getCurrentChatId() !== name) {
+            return;
+        }
+
+        const names = Array.from(new Set([...list, name].map(String))).sort((a, b) => a.localeCompare(b));
+        const fragment = document.createDocumentFragment();
+        for (const chatId of names) {
+            const option = document.createElement('option');
+            option.innerText = chatId;
+            option.value = chatId;
+            option.selected = chatId === name;
+            fragment.appendChild(option);
+        }
+
+        chatName.replaceChildren(fragment);
+        chatName.disabled = false;
+        chatSelectorContextKey = contextKey;
+        loadedChatSelectorContextKey = contextKey;
+    })().finally(() => {
+        if (chatSelectorLoadPromise?.generation === generation) {
+            chatSelectorLoadPromise = null;
+        }
+    });
+
+    chatSelectorLoadPromise = { contextKey, generation, promise };
+    return promise;
 }
 
 /**
@@ -311,10 +302,63 @@ async function getChatFiles() {
  * @param {object} options Highlight options
  */
 function clearHighlights(options) {
-    // Only target elements with actual highlights for efficiency
-    jQuery(chat).find('mark.highlight').each(function () {
-        jQuery(this).unhighlight(options);
-    });
+    if (highlightedMessages.size > 0) {
+        jQuery(Array.from(highlightedMessages)).unhighlight(options);
+        highlightedMessages.clear();
+    }
+}
+
+/**
+ * Parse a search query while preserving the existing space-separated OR behavior.
+ * @param {string} query Search query
+ * @returns {{terms: string[], termsLower: string[]}}
+ */
+function parseSearchQuery(query) {
+    const terms = query.split(/\s+/).filter(term => term.length > 0);
+    return {
+        terms,
+        termsLower: terms.map(term => term.toLowerCase()),
+    };
+}
+
+/**
+ * Highlight matching messages and remember exactly which elements were changed.
+ * @param {HTMLElement[]} elements Matching message elements
+ * @param {string[]} queryTerms Original-cased query terms
+ * @param {object} options Highlight options
+ */
+function highlightMessages(elements, queryTerms, options) {
+    if (elements.length === 0) {
+        return;
+    }
+
+    jQuery(elements).highlight(queryTerms, options);
+    elements.forEach(element => highlightedMessages.add(element));
+}
+
+/**
+ * Refresh highlights only for messages whose rendered text changed.
+ * @param {Set<HTMLElement>} updatedMessages Added or changed message elements
+ * @param {Set<HTMLElement>} removedMessages Removed message elements
+ */
+function onMessageCacheChanged(updatedMessages, removedMessages) {
+    removedMessages.forEach(element => highlightedMessages.delete(element));
+
+    const query = searchInput.value.trim();
+    if (!query || updatedMessages.size === 0) {
+        return;
+    }
+
+    const options = { element: 'mark', className: 'highlight' };
+    const { terms, termsLower } = parseSearchQuery(query);
+    const previouslyHighlighted = Array.from(updatedMessages).filter(element => highlightedMessages.has(element));
+    if (previouslyHighlighted.length > 0) {
+        jQuery(previouslyHighlighted).unhighlight(options);
+        previouslyHighlighted.forEach(element => highlightedMessages.delete(element));
+    }
+
+    const matching = messageCache.findMatches(termsLower, updatedMessages);
+    highlightMessages(matching, terms, options);
 }
 
 /**
@@ -329,30 +373,27 @@ function searchInChat(query) {
     clearHighlights(options);
 
     if (!query) {
+        messageCache.destroy();
         return;
     }
 
-    // Split query into terms and filter empty strings
-    const queryTerms = query.split(/\s+/).filter(t => t.length > 0);
-    if (queryTerms.length === 0) {
+    messageCache.init();
+
+    const { terms, termsLower } = parseSearchQuery(query);
+    if (terms.length === 0) {
         return;
     }
-
-    const queryLower = queryTerms.map(t => t.toLowerCase());
 
     // Pre-filter: only highlight messages containing search terms
-    const cached = messageCache.getMessages();
-    const matching = cached.filter(m =>
-        queryLower.some(term => m.textLower.includes(term)),
-    );
-
-    // Only call highlight on messages that actually contain matches
-    if (matching.length > 0) {
-        jQuery(matching.map(m => m.element)).highlight(queryTerms, options);
-    }
+    const matching = messageCache.findMatches(termsLower);
+    highlightMessages(matching, terms, options);
 }
 
-const searchDebounced = debounce((x) => searchInChat(x), 250);
+const searchDebounced = debounce((x) => {
+    if (x === searchInput.value.trim()) {
+        searchInChat(x);
+    }
+}, 250);
 
 /**
  * Clear search input and highlights
@@ -360,6 +401,16 @@ const searchDebounced = debounce((x) => searchInChat(x), 250);
 function clearSearch() {
     searchInput.value = '';
     searchInChat('');
+}
+
+function onSearchInput() {
+    const query = searchInput.value.trim();
+    if (!query) {
+        searchInChat('');
+        return;
+    }
+
+    searchDebounced(query);
 }
 const updateStatusDebounced = debounce(onOnlineStatusChange, 1000);
 
@@ -370,7 +421,7 @@ function addTopBar() {
     searchInput.placeholder = 'Search...';
     searchInput.classList.add('text_pole');
     searchInput.type = 'search';
-    searchInput.addEventListener('input', () => searchDebounced(searchInput.value.trim()));
+    searchInput.addEventListener('input', onSearchInput);
     topBar.append(chatName, searchInput);
     sheld.insertBefore(topBar, chat);
 }
@@ -786,17 +837,23 @@ function restorePanelsState() {
     addConnectionProfiles();
     setChatName(getCurrentChatId());
     chatName.addEventListener('change', onChatNameChange);
-    const setChatNameDebounced = debounce(() => setChatName(getCurrentChatId()), debounce_timeout.short);
+    chatName.addEventListener('focus', ensureChatSelectorLoaded);
+    chatName.addEventListener('pointerdown', ensureChatSelectorLoaded);
+    const setChatNameDebounced = debounce(() => {
+        invalidateChatSelector();
+        setChatName(getCurrentChatId());
+        const sidebar = document.getElementById('extensionSideBar');
+        if (sidebar?.classList.contains('visible')) {
+            populateSideBar();
+        }
+    }, debounce_timeout.short);
     for (const eventName of [event_types.CHAT_CHANGED, event_types.CHAT_DELETED, event_types.GROUP_CHAT_DELETED]) {
         eventSource.on(eventName, setChatNameDebounced);
     }
-    // Clear search and rebuild cache on chat change
+    // Clear search and release its cache on chat change.
     eventSource.on(event_types.CHAT_CHANGED, () => {
         clearSearch();
-        messageCache.rebuild();
     });
-    // Initialize message cache
-    messageCache.init();
     eventSource.once(event_types.APP_READY, () => {
         bindConnectionProfilesSelect();
         restorePanelsState();
