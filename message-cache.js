@@ -12,13 +12,15 @@ export class MessageCache {
         /** @type {Map<HTMLElement, string>} */
         this.messages = new Map();
         this.observer = null;
-        /** @type {Set<Node>} */
-        this.pendingAddedNodes = new Set();
-        /** @type {Set<Node>} */
-        this.pendingRemovedNodes = new Set();
+        // Never retain replaced streaming child nodes while animation frames
+        // are suspended. A bounded dirty-message set is enough to rebuild text.
+        this.pendingRemovedMessages = new Set();
         /** @type {Set<HTMLElement>} */
         this.pendingChangedMessages = new Set();
         this.flushHandle = null;
+        this.flushTimer = null;
+        this.needsRebuild = false;
+        this.maxPendingMessages = 512;
     }
 
     /**
@@ -68,10 +70,27 @@ export class MessageCache {
      * @param {MutationRecord[]} mutations Mutation records from the chat observer
      */
     queueMutations(mutations) {
+        const queue = (set, element) => {
+            if (this.needsRebuild) return;
+            set.add(element);
+            if (this.pendingChangedMessages.size + this.pendingRemovedMessages.size > this.maxPendingMessages) {
+                this.pendingChangedMessages.clear();
+                this.pendingRemovedMessages.clear();
+                this.needsRebuild = true;
+            }
+        };
+        const visitMessages = (node, callback) => {
+            if (node instanceof HTMLElement && node.matches('.mes_text')) callback(node);
+            if (node.querySelectorAll) for (const element of node.querySelectorAll('.mes_text')) callback(element);
+        };
         for (const mutation of mutations) {
             if (mutation.type === 'childList') {
-                mutation.addedNodes.forEach(node => this.pendingAddedNodes.add(node));
-                mutation.removedNodes.forEach(node => this.pendingRemovedNodes.add(node));
+                mutation.removedNodes.forEach(node => visitMessages(node, element => {
+                    this.messages.delete(element);
+                    queue(this.pendingRemovedMessages, element);
+                }));
+                if (!this.needsRebuild) mutation.addedNodes.forEach(node => visitMessages(node,
+                    element => queue(this.pendingChangedMessages, element)));
             }
 
             const target = mutation.target instanceof Element
@@ -79,12 +98,15 @@ export class MessageCache {
                 : mutation.target.parentElement;
             const containingMessage = target?.closest?.('.mes_text');
             if (containingMessage instanceof HTMLElement) {
-                this.pendingChangedMessages.add(containingMessage);
+                queue(this.pendingChangedMessages, containingMessage);
             }
         }
 
         if (this.flushHandle === null) {
             this.flushHandle = requestAnimationFrame(() => this.flushMutations());
+            // A background tab can stop animation frames. This fallback drains
+            // bounded state when timers run; queue size stays capped either way.
+            this.flushTimer = setTimeout(() => this.flushMutations(), 250);
         }
     }
 
@@ -111,20 +133,25 @@ export class MessageCache {
      * Apply queued mutations without rescanning unaffected messages.
      */
     flushMutations() {
+        if (this.flushHandle !== null) cancelAnimationFrame(this.flushHandle);
         this.flushHandle = null;
+        if (this.flushTimer !== null) clearTimeout(this.flushTimer);
+        this.flushTimer = null;
 
-        const addedMessages = new Set();
-        const removedMessages = new Set();
-        this.pendingAddedNodes.forEach(node => this.collectMessageElements(node, addedMessages));
-        this.pendingRemovedNodes.forEach(node => this.collectMessageElements(node, removedMessages));
-
-        const changedMessages = new Set([...addedMessages, ...this.pendingChangedMessages]);
-        this.pendingAddedNodes.clear();
-        this.pendingRemovedNodes.clear();
+        const rebuilt = this.needsRebuild;
+        const removedMessages = new Set(this.pendingRemovedMessages);
+        const changedMessages = new Set(this.pendingChangedMessages);
+        this.pendingRemovedMessages.clear();
         this.pendingChangedMessages.clear();
-
-        for (const element of removedMessages) {
-            this.messages.delete(element);
+        for (const element of this.messages.keys()) {
+            if (!element.isConnected || !this.chat.contains(element)) {
+                this.messages.delete(element);
+                removedMessages.add(element);
+            }
+        }
+        if (this.needsRebuild) {
+            for (const element of this.chat.querySelectorAll('.mes_text')) changedMessages.add(element);
+            this.needsRebuild = false;
         }
 
         const updatedMessages = new Set();
@@ -140,7 +167,7 @@ export class MessageCache {
             }
         }
 
-        this.onChanged(updatedMessages, removedMessages);
+        this.onChanged(updatedMessages, removedMessages, { rebuilt });
         // Highlighting only wraps existing text, so discard those observer records.
         this.observer?.takeRecords();
     }
@@ -150,9 +177,9 @@ export class MessageCache {
      */
     clear() {
         this.messages.clear();
-        this.pendingAddedNodes.clear();
-        this.pendingRemovedNodes.clear();
+        this.pendingRemovedMessages.clear();
         this.pendingChangedMessages.clear();
+        this.needsRebuild = false;
     }
 
     /**
@@ -165,6 +192,8 @@ export class MessageCache {
             cancelAnimationFrame(this.flushHandle);
             this.flushHandle = null;
         }
+        if (this.flushTimer !== null) clearTimeout(this.flushTimer);
+        this.flushTimer = null;
         this.clear();
     }
 }

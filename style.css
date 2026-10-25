@@ -240,3 +240,7 @@ body.movingUI #extensionTopBar {
     opacity: 0.5;
     border-color: transparent;
 }
+#extensionTopBar .extensionTopBarSearchNav { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; font-size: 12px; }
+#extensionTopBar .extensionTopBarSearchNav[hidden] { display: none; }
+#extensionTopBar .extensionTopBarSearchNav button { cursor: pointer; padding: 1px 5px; color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 4px; }
+#extensionTopBar .extensionTopBarSearchNav button:disabled { opacity: .4; cursor: default; }

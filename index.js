@@ -9,13 +9,13 @@ const {
     executeSlashCommandsWithOptions,
     Popup,
 } = SillyTavern.getContext();
-import { addJQueryHighlight } from './jquery-highlight.js';
 import { getGroupPastChats } from '../../../group-chats.js';
 import { getPastCharacterChats, animation_duration, animation_easing, getGeneratingApi } from '../../../../script.js';
 import { debounce, timestampToMoment, sortMoments, uuidv4, waitUntilCondition } from '../../../utils.js';
 import { debounce_timeout } from '../../../constants.js';
 import { t } from '../../../i18n.js';
 import { MessageCache } from './message-cache.js';
+import { highlightMessage, clearMessageHighlights, selectHighlightMessages } from './search-highlights.js';
 
 const movingDivs = /** @type {HTMLDivElement} */ (document.getElementById('movingDivs'));
 const sheld = /** @type {HTMLDivElement} */ (document.getElementById('sheld'));
@@ -30,6 +30,11 @@ const chatName = document.createElement('select');
 const searchInput = document.createElement('input');
 /** @type {Set<HTMLElement>} */
 const highlightedMessages = new Set();
+const searchMatchSet = new Set();
+let searchMatches = [];
+let activeSearchMatch = 0;
+let highlightFrame = null;
+const searchNav = document.createElement('span');
 const connectionProfiles = document.createElement('div');
 const connectionProfilesStatus = document.createElement('div');
 const connectionProfilesSelect = document.createElement('select');
@@ -302,10 +307,8 @@ async function getChatFiles() {
  * @param {object} options Highlight options
  */
 function clearHighlights(options) {
-    if (highlightedMessages.size > 0) {
-        jQuery(Array.from(highlightedMessages)).unhighlight(options);
-        highlightedMessages.clear();
-    }
+    for (const element of highlightedMessages) clearMessageHighlights(element);
+    highlightedMessages.clear();
 }
 
 /**
@@ -328,12 +331,46 @@ function parseSearchQuery(query) {
  * @param {object} options Highlight options
  */
 function highlightMessages(elements, queryTerms, options) {
-    if (elements.length === 0) {
-        return;
+    for (const element of elements) {
+        highlightMessage(element, queryTerms);
+        highlightedMessages.add(element);
     }
+}
 
-    jQuery(elements).highlight(queryTerms, options);
-    elements.forEach(element => highlightedMessages.add(element));
+function updateSearchNavigation() {
+    searchNav.hidden = !searchInput.value.trim();
+    const count = searchNav.querySelector('[data-search-count]');
+    if (count) count.textContent = searchMatches.length ? `${activeSearchMatch + 1}/${searchMatches.length}` : '0';
+    for (const button of searchNav.querySelectorAll('button')) button.disabled = !searchMatches.length;
+}
+
+function renderVisibleHighlights(changed = new Set()) {
+    const { terms } = parseSearchQuery(searchInput.value.trim());
+    const rect = chat.getBoundingClientRect();
+    const selected = selectHighlightMessages(searchMatches, activeSearchMatch,
+        { top: Math.max(0, rect.top) - 200, bottom: Math.min(window.innerHeight, rect.bottom) + 200 });
+    const wanted = new Set(selected);
+    for (const element of highlightedMessages) {
+        if (!wanted.has(element) || changed.has(element)) {
+            clearMessageHighlights(element);
+            highlightedMessages.delete(element);
+        }
+    }
+    highlightMessages(selected.filter(element => !highlightedMessages.has(element)), terms);
+    messageCache.observer?.takeRecords();
+}
+
+function scheduleVisibleHighlights() {
+    if (!searchInput.value.trim() || highlightFrame !== null) return;
+    highlightFrame = requestAnimationFrame(() => { highlightFrame = null; renderVisibleHighlights(); });
+}
+
+function moveSearchMatch(step) {
+    if (!searchMatches.length) return;
+    activeSearchMatch = (activeSearchMatch + step + searchMatches.length) % searchMatches.length;
+    searchMatches[activeSearchMatch].scrollIntoView({ block: 'center' });
+    updateSearchNavigation();
+    renderVisibleHighlights();
 }
 
 /**
@@ -341,24 +378,34 @@ function highlightMessages(elements, queryTerms, options) {
  * @param {Set<HTMLElement>} updatedMessages Added or changed message elements
  * @param {Set<HTMLElement>} removedMessages Removed message elements
  */
-function onMessageCacheChanged(updatedMessages, removedMessages) {
-    removedMessages.forEach(element => highlightedMessages.delete(element));
-
+function onMessageCacheChanged(updatedMessages, removedMessages, { rebuilt = false } = {}) {
     const query = searchInput.value.trim();
-    if (!query || updatedMessages.size === 0) {
-        return;
+    if (!query) return;
+    const active = searchMatches[activeSearchMatch];
+    let membershipChanged = false;
+    for (const element of removedMessages) {
+        membershipChanged = searchMatchSet.delete(element) || membershipChanged;
+        highlightedMessages.delete(element);
     }
-
-    const options = { element: 'mark', className: 'highlight' };
-    const { terms, termsLower } = parseSearchQuery(query);
-    const previouslyHighlighted = Array.from(updatedMessages).filter(element => highlightedMessages.has(element));
-    if (previouslyHighlighted.length > 0) {
-        jQuery(previouslyHighlighted).unhighlight(options);
-        previouslyHighlighted.forEach(element => highlightedMessages.delete(element));
+    const { termsLower } = parseSearchQuery(query);
+    if (rebuilt) {
+        searchMatchSet.clear();
+        for (const element of messageCache.findMatches(termsLower)) searchMatchSet.add(element);
+        membershipChanged = true;
     }
-
-    const matching = messageCache.findMatches(termsLower, updatedMessages);
-    highlightMessages(matching, terms, options);
+    const matching = new Set(messageCache.findMatches(termsLower, updatedMessages));
+    for (const element of updatedMessages) {
+        if (matching.has(element)) {
+            if (!searchMatchSet.has(element)) membershipChanged = true;
+            searchMatchSet.add(element);
+        } else membershipChanged = searchMatchSet.delete(element) || membershipChanged;
+    }
+    if (membershipChanged) {
+        searchMatches = [...searchMatchSet].sort((a, b) => a === b ? 0 : a.compareDocumentPosition(b) & 2 ? 1 : -1);
+        activeSearchMatch = Math.max(0, searchMatches.indexOf(active));
+        updateSearchNavigation();
+    }
+    renderVisibleHighlights(updatedMessages);
 }
 
 /**
@@ -373,7 +420,13 @@ function searchInChat(query) {
     clearHighlights(options);
 
     if (!query) {
+        searchMatches = [];
+        searchMatchSet.clear();
+        activeSearchMatch = 0;
+        if (highlightFrame !== null) cancelAnimationFrame(highlightFrame);
+        highlightFrame = null;
         messageCache.destroy();
+        updateSearchNavigation();
         return;
     }
 
@@ -385,8 +438,12 @@ function searchInChat(query) {
     }
 
     // Pre-filter: only highlight messages containing search terms
-    const matching = messageCache.findMatches(termsLower);
-    highlightMessages(matching, terms, options);
+    searchMatches = messageCache.findMatches(termsLower);
+    searchMatchSet.clear();
+    searchMatches.forEach(element => searchMatchSet.add(element));
+    activeSearchMatch = 0;
+    updateSearchNavigation();
+    renderVisibleHighlights();
 }
 
 const searchDebounced = debounce((x) => {
@@ -422,7 +479,19 @@ function addTopBar() {
     searchInput.classList.add('text_pole');
     searchInput.type = 'search';
     searchInput.addEventListener('input', onSearchInput);
-    topBar.append(chatName, searchInput);
+    searchInput.addEventListener('keydown', event => {
+        if (event.key === 'Enter') { event.preventDefault(); moveSearchMatch(event.shiftKey ? -1 : 1); }
+    });
+    searchNav.className = 'extensionTopBarSearchNav';
+    searchNav.hidden = true;
+    searchNav.innerHTML = '<button type="button" data-search-step="-1" title="Previous matching message" aria-label="Previous matching message">‹</button><span data-search-count title="Matching messages"></span><button type="button" data-search-step="1" title="Next matching message" aria-label="Next matching message">›</button>';
+    searchNav.addEventListener('click', event => {
+        const step = event.target.closest('[data-search-step]')?.dataset.searchStep;
+        if (step) moveSearchMatch(Number(step));
+    });
+    chat.addEventListener('scroll', scheduleVisibleHighlights, { passive: true });
+    window.addEventListener('resize', scheduleVisibleHighlights, { passive: true });
+    topBar.append(chatName, searchInput, searchNav);
     sheld.insertBefore(topBar, chat);
 }
 
@@ -829,7 +898,6 @@ function restorePanelsState() {
 
 // Init extension on load
 (async function () {
-    addJQueryHighlight();
     patchSheldIfNeeded();
     addTopBar();
     addIcons();
