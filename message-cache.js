@@ -4,9 +4,12 @@
 export class MessageCache {
     /**
      * @param {HTMLElement} chat Chat container
-     * @param {(updatedMessages: Set<HTMLElement>, removedMessages: Set<HTMLElement>) => void} onChanged Cache change callback
+     * @param {(updatedMessages: Set<HTMLElement>, removedMessages: Set<HTMLElement>, state: {rebuilt: boolean, rerenderedMessages: Set<HTMLElement>}) => void} onChanged Cache change callback
+     * @param {object} [options]
+     * @param {number} [options.minFlushInterval] Minimum milliseconds between refreshes while mutations keep coming
+     * @param {(element: HTMLElement) => boolean} [options.needsNextFrame] Messages whose refresh must not wait for the interval
      */
-    constructor(chat, onChanged) {
+    constructor(chat, onChanged, { minFlushInterval = 200, needsNextFrame = () => false } = {}) {
         this.chat = chat;
         this.onChanged = onChanged;
         /** @type {Map<HTMLElement, string>} */
@@ -21,6 +24,11 @@ export class MessageCache {
         this.flushTimer = null;
         this.needsRebuild = false;
         this.maxPendingMessages = 512;
+        // Streaming rewrites a message many times per second. A lone change still refreshes on
+        // the next frame; a burst refreshes once per interval and a trailing timer takes the rest.
+        this.minFlushInterval = minFlushInterval;
+        this.needsNextFrame = needsNextFrame;
+        this.lastFlushAt = -Infinity;
     }
 
     /**
@@ -43,7 +51,7 @@ export class MessageCache {
         this.messages.clear();
         for (const element of this.chat.querySelectorAll('.mes_text')) {
             if (element instanceof HTMLElement) {
-                this.messages.set(element, element.textContent?.toLowerCase() || '');
+                this.messages.set(element, element.textContent || '');
             }
         }
     }
@@ -55,10 +63,11 @@ export class MessageCache {
      * @returns {HTMLElement[]}
      */
     findMatches(queryTermsLower, elements = this.messages.keys()) {
+        const patterns = queryTermsLower.map(term => new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
         const matching = [];
         for (const element of elements) {
             const textLower = this.messages.get(element);
-            if (textLower !== undefined && queryTermsLower.some(term => textLower.includes(term))) {
+            if (textLower !== undefined && patterns.some(pattern => pattern.test(textLower))) {
                 matching.push(element);
             }
         }
@@ -102,12 +111,32 @@ export class MessageCache {
             }
         }
 
-        if (this.flushHandle === null) {
+        const urgent = this.flushHandle === null && [...this.pendingChangedMessages].some(this.needsNextFrame);
+        if (urgent && this.flushTimer !== null) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+
+        if (this.flushHandle === null && this.flushTimer === null) {
+            const wait = urgent ? 0 : this.lastFlushAt + this.minFlushInterval - Date.now();
+            if (wait > 0) {
+                this.flushTimer = setTimeout(() => this.flushMutations(), Math.min(wait, this.minFlushInterval));
+                return;
+            }
             this.flushHandle = requestAnimationFrame(() => this.flushMutations());
             // A background tab can stop animation frames. This fallback drains
             // bounded state when timers run; queue size stays capped either way.
             this.flushTimer = setTimeout(() => this.flushMutations(), 250);
         }
+    }
+
+    /**
+     * Apply anything still queued now, without waiting for the next refresh.
+     */
+    flushPending() {
+        const records = this.observer?.takeRecords();
+        if (records?.length) this.queueMutations(records);
+        if (this.flushHandle !== null || this.flushTimer !== null) this.flushMutations();
     }
 
     /**
@@ -155,21 +184,26 @@ export class MessageCache {
         }
 
         const updatedMessages = new Set();
+        // Touched but with the same text, possibly after changing and changing back: marks may be gone.
+        const rerenderedMessages = new Set();
         for (const element of changedMessages) {
             if (!element.isConnected || !this.chat.contains(element)) {
                 continue;
             }
 
-            const textLower = element.textContent?.toLowerCase() || '';
+            const textLower = element.textContent || '';
             if (!this.messages.has(element) || this.messages.get(element) !== textLower) {
                 this.messages.set(element, textLower);
                 updatedMessages.add(element);
+            } else {
+                rerenderedMessages.add(element);
             }
         }
 
-        this.onChanged(updatedMessages, removedMessages, { rebuilt });
+        this.onChanged(updatedMessages, removedMessages, { rebuilt, rerenderedMessages });
         // Highlighting only wraps existing text, so discard those observer records.
         this.observer?.takeRecords();
+        this.lastFlushAt = Date.now();
     }
 
     /**
@@ -194,6 +228,7 @@ export class MessageCache {
         }
         if (this.flushTimer !== null) clearTimeout(this.flushTimer);
         this.flushTimer = null;
+        this.lastFlushAt = -Infinity;
         this.clear();
     }
 }

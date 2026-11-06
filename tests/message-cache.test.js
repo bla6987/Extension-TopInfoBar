@@ -35,7 +35,7 @@ try {
         if (updated.size > 0 || removed.size > 0) {
             changes.push({ updated: updated.size, removed: removed.size });
         }
-    });
+    }, { minFlushInterval: 0 });
     cache.init();
 
     assert(cache.messages.size === 1000, 'Initial cache should contain all rendered messages');

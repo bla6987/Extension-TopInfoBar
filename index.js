@@ -11,11 +11,12 @@ const {
 } = SillyTavern.getContext();
 import { getGroupPastChats } from '../../../group-chats.js';
 import { getPastCharacterChats, animation_duration, animation_easing, getGeneratingApi } from '../../../../script.js';
-import { debounce, timestampToMoment, sortMoments, uuidv4, waitUntilCondition } from '../../../utils.js';
+import { debounce, timestampToMoment, sortMoments, waitUntilCondition } from '../../../utils.js';
 import { debounce_timeout } from '../../../constants.js';
 import { t } from '../../../i18n.js';
 import { MessageCache } from './message-cache.js';
-import { highlightMessage, clearMessageHighlights, selectHighlightMessages } from './search-highlights.js';
+import { highlightMessage, clearMessageHighlights, selectHighlightMessages, compileSearchQuery, forgetWipedHighlights } from './search-highlights.js';
+import { SideBarRefresher } from './sidebar-refresh.js';
 
 const movingDivs = /** @type {HTMLDivElement} */ (document.getElementById('movingDivs'));
 const sheld = /** @type {HTMLDivElement} */ (document.getElementById('sheld'));
@@ -23,7 +24,17 @@ const chat = /** @type {HTMLDivElement} */ (document.getElementById('chat'));
 const draggableTemplate = /** @type {HTMLTemplateElement} */ (document.getElementById('generic_draggable_template'));
 const apiBlock = /** @type {HTMLDivElement} */ (document.getElementById('rm_api_block'));
 
-const messageCache = new MessageCache(chat, onMessageCacheChanged);
+const messageCache = new MessageCache(chat, onMessageCacheChanged, {
+    // Rewriting a highlighted message wipes its marks, so restoring them can't wait or they flicker.
+    needsNextFrame: element => highlightedMessages.has(element),
+});
+const sideBarRefresher = new SideBarRefresher({
+    getOwnerKey: () => getChatSelectorContextKey(),
+    getChatId: () => getCurrentChatId(),
+    isVisible: () => Boolean(document.getElementById('extensionSideBar')?.classList.contains('visible')),
+    loadChats: loadSideBarChats,
+    render: renderSideBar,
+});
 
 const topBar = document.createElement('div');
 const chatName = document.createElement('select');
@@ -31,6 +42,7 @@ const searchInput = document.createElement('input');
 /** @type {Set<HTMLElement>} */
 const highlightedMessages = new Set();
 const searchMatchSet = new Set();
+let compiledSearch = null;
 let searchMatches = [];
 let activeSearchMatch = 0;
 let highlightFrame = null;
@@ -225,7 +237,9 @@ function ensureChatSelectorLoaded() {
             }
         } else {
             const characterAvatar = context.characters[context.characterId]?.avatar;
-            list.push(...await getListOfCharacterChats(characterAvatar));
+            const chats = await getListOfCharacterChats(characterAvatar);
+            if (chats === null) return;
+            list.push(...chats);
         }
 
         if (generation !== chatSelectorLoadGeneration
@@ -272,14 +286,14 @@ async function getListOfCharacterChats(avatar) {
         });
 
         if (!result.ok) {
-            return [];
+            return null;
         }
 
         const data = await result.json();
-        return data.map(x => String(x.file_name).replace('.jsonl', ''));
+        return data.map(x => String(x.file_id ?? x.file_name).replace(/\.jsonl$/, ''));
     } catch (error) {
         console.error('Failed to get list of character chats', error);
-        return [];
+        return null;
     }
 }
 
@@ -312,27 +326,25 @@ function clearHighlights(options) {
 }
 
 /**
- * Parse a search query while preserving the existing space-separated OR behavior.
+ * Get a query's parsed terms and highlight pattern, compiling only when the query changes.
  * @param {string} query Search query
- * @returns {{terms: string[], termsLower: string[]}}
+ * @returns {ReturnType<typeof compileSearchQuery>}
  */
-function parseSearchQuery(query) {
-    const terms = query.split(/\s+/).filter(term => term.length > 0);
-    return {
-        terms,
-        termsLower: terms.map(term => term.toLowerCase()),
-    };
+function getCompiledSearch(query) {
+    if (compiledSearch?.query !== query) {
+        compiledSearch = compileSearchQuery(query);
+    }
+    return compiledSearch;
 }
 
 /**
  * Highlight matching messages and remember exactly which elements were changed.
  * @param {HTMLElement[]} elements Matching message elements
- * @param {string[]} queryTerms Original-cased query terms
- * @param {object} options Highlight options
+ * @param {RegExp|null} pattern Compiled query pattern
  */
-function highlightMessages(elements, queryTerms, options) {
+function highlightMessages(elements, pattern) {
     for (const element of elements) {
-        highlightMessage(element, queryTerms);
+        highlightMessage(element, pattern);
         highlightedMessages.add(element);
     }
 }
@@ -345,7 +357,7 @@ function updateSearchNavigation() {
 }
 
 function renderVisibleHighlights(changed = new Set()) {
-    const { terms } = parseSearchQuery(searchInput.value.trim());
+    const { pattern } = getCompiledSearch(searchInput.value.trim());
     const rect = chat.getBoundingClientRect();
     const selected = selectHighlightMessages(searchMatches, activeSearchMatch,
         { top: Math.max(0, rect.top) - 200, bottom: Math.min(window.innerHeight, rect.bottom) + 200 });
@@ -356,7 +368,7 @@ function renderVisibleHighlights(changed = new Set()) {
             highlightedMessages.delete(element);
         }
     }
-    highlightMessages(selected.filter(element => !highlightedMessages.has(element)), terms);
+    highlightMessages(selected.filter(element => !highlightedMessages.has(element)), pattern);
     messageCache.observer?.takeRecords();
 }
 
@@ -378,7 +390,7 @@ function moveSearchMatch(step) {
  * @param {Set<HTMLElement>} updatedMessages Added or changed message elements
  * @param {Set<HTMLElement>} removedMessages Removed message elements
  */
-function onMessageCacheChanged(updatedMessages, removedMessages, { rebuilt = false } = {}) {
+function onMessageCacheChanged(updatedMessages, removedMessages, { rebuilt = false, rerenderedMessages = new Set() } = {}) {
     const query = searchInput.value.trim();
     if (!query) return;
     const active = searchMatches[activeSearchMatch];
@@ -387,7 +399,7 @@ function onMessageCacheChanged(updatedMessages, removedMessages, { rebuilt = fal
         membershipChanged = searchMatchSet.delete(element) || membershipChanged;
         highlightedMessages.delete(element);
     }
-    const { termsLower } = parseSearchQuery(query);
+    const { termsLower } = getCompiledSearch(query);
     if (rebuilt) {
         searchMatchSet.clear();
         for (const element of messageCache.findMatches(termsLower)) searchMatchSet.add(element);
@@ -405,6 +417,7 @@ function onMessageCacheChanged(updatedMessages, removedMessages, { rebuilt = fal
         activeSearchMatch = Math.max(0, searchMatches.indexOf(active));
         updateSearchNavigation();
     }
+    forgetWipedHighlights(highlightedMessages, rerenderedMessages);
     renderVisibleHighlights(updatedMessages);
 }
 
@@ -420,6 +433,7 @@ function searchInChat(query) {
     clearHighlights(options);
 
     if (!query) {
+        compiledSearch = null;
         searchMatches = [];
         searchMatchSet.clear();
         activeSearchMatch = 0;
@@ -432,7 +446,7 @@ function searchInChat(query) {
 
     messageCache.init();
 
-    const { terms, termsLower } = parseSearchQuery(query);
+    const { terms, termsLower } = getCompiledSearch(query);
     if (terms.length === 0) {
         return;
     }
@@ -650,21 +664,23 @@ async function populateSideBar() {
     }
 
     loader.classList.add('displayNone');
-    const processId = uuidv4();
-    const scrollTop = container.scrollTop;
+    return sideBarRefresher.refresh();
+}
+
+async function loadSideBarChats() {
     const prettify = x => {
         x.last_mes = timestampToMoment(x.last_mes);
-        x.file_name = String(x.file_name).replace('.jsonl', '');
+        x.file_name = String(x.file_id ?? x.file_name).replace(/\.jsonl$/, '');
         return x;
     };
-    container.dataset.processId = processId;
-    const chatId = getCurrentChatId();
-    const chats = (await getChatFiles()).map(prettify).sort((a, b) => sortMoments(a.last_mes, b.last_mes));
+    return (await getChatFiles()).map(prettify).sort((a, b) => sortMoments(a.last_mes, b.last_mes));
+}
 
-    if (container.dataset.processId !== processId) {
-        console.log(t`Aborting populateSideBar due to process id mismatch`);
-        return;
-    }
+function renderSideBar(chats, chatId) {
+    const owner = getChatSelectorContextKey();
+    const loader = document.getElementById('extensionSideBarLoader');
+    const container = document.getElementById('extensionSideBarContainer');
+    const scrollTop = container.scrollTop;
 
     container.innerHTML = '';
 
@@ -673,6 +689,7 @@ async function populateSideBar() {
         sideBarItem.classList.add('sideBarItem');
 
         sideBarItem.addEventListener('click', async () => {
+            if (getChatSelectorContextKey() !== owner) return;
             if (chat.file_name === chatId || sideBarItem.classList.contains('selected')) {
                 return;
             }
@@ -737,7 +754,7 @@ async function populateSideBar() {
     /** @type {HTMLElement} */
     const selectedElement = container.querySelector('.selected');
     const isSelectedElementVisible = selectedElement && selectedElement.offsetTop >= container.scrollTop && selectedElement.offsetTop <= container.scrollTop + container.clientHeight;
-    if (!isSelectedElementVisible) {
+    if (selectedElement && !isSelectedElementVisible) {
         container.scrollTop = selectedElement.offsetTop - container.clientHeight / 2;
     }
 
@@ -916,7 +933,13 @@ function restorePanelsState() {
         }
     }, debounce_timeout.short);
     for (const eventName of [event_types.CHAT_CHANGED, event_types.CHAT_DELETED, event_types.GROUP_CHAT_DELETED]) {
+        // Lists requested before this must not be shown or reused, even before the debounce fires.
+        eventSource.on(eventName, () => sideBarRefresher.invalidate());
         eventSource.on(eventName, setChatNameDebounced);
+    }
+    // Streaming refreshes are rate limited; show the final text as soon as generation ends.
+    for (const eventName of [event_types.GENERATION_ENDED, event_types.GENERATION_STOPPED]) {
+        eventSource.on(eventName, () => messageCache.flushPending());
     }
     // Clear search and release its cache on chat change.
     eventSource.on(event_types.CHAT_CHANGED, () => {

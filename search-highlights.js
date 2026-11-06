@@ -11,10 +11,42 @@ export function clearMessageHighlights(element) {
     }
 }
 
-export function highlightMessage(element, terms, limit = MAX_HIGHLIGHTS_PER_MESSAGE) {
+/** Forget messages whose marks a rerender wiped, so the next render restores them. */
+export function forgetWipedHighlights(highlighted, rerendered) {
+    for (const element of highlighted) {
+        if (rerendered.has(element) && !element.querySelector(`mark.${MARK_CLASS}`)) highlighted.delete(element);
+    }
+}
+
+function compileHighlightPattern(terms) {
     const words = terms.filter(Boolean).map(term => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    if (!words.length || limit < 1) return 0;
-    const pattern = new RegExp(words.join('|'), 'i');
+    return words.length ? new RegExp(words.join('|'), 'i') : null;
+}
+
+/**
+ * Parse a search query while preserving the existing space-separated OR behavior.
+ * @param {string} query Search query
+ * @returns {{query: string, terms: string[], termsLower: string[], pattern: RegExp|null}}
+ */
+export function compileSearchQuery(query) {
+    const terms = query.split(/\s+/).filter(term => term.length > 0);
+    return {
+        query,
+        terms,
+        termsLower: terms.map(term => term.toLowerCase()),
+        pattern: compileHighlightPattern(terms),
+    };
+}
+
+/**
+ * @param {HTMLElement} element Message element
+ * @param {RegExp|string[]|null} terms Pattern from compileSearchQuery, or terms to compile
+ * @param {number} [limit] Maximum marks in this message
+ * @returns {number} Marks added
+ */
+export function highlightMessage(element, terms, limit = MAX_HIGHLIGHTS_PER_MESSAGE) {
+    const pattern = Array.isArray(terms) ? compileHighlightPattern(terms) : terms;
+    if (!pattern || limit < 1) return 0;
     const doc = element.ownerDocument;
     const walker = doc.createTreeWalker(element, 4, {
         acceptNode: node => node.parentElement?.closest(`script,style,textarea,mark.${MARK_CLASS}`) ? 2 : 1,
